@@ -50,15 +50,13 @@ function readProcSnapshot(pid: number): ProcSnapshot | null {
 }
 
 /**
- * Collect all processes belonging to the launched Chromium instance.
- * Note: Under the SUID sandbox (`chrome-sandbox`), the helper clones the
- * sandboxed `--type=zygote` into a new PID namespace (`CLONE_NEWPID`, where
- * `NStgid` has 2 entries with namespace PID 1) and then exits, so the
- * sandboxed zygote is reparented in the host PID namespace while keeping
- * `cmdline[0] === rootExe`. Matching both `cmdline[0] === rootExe` and any
- * PPid descendants captures both direct children and PID-namespaced zygote/renderer
- * processes.
+ * Chromium on Linux rewrites child argv via setproctitle into a single
+ * space-delimited string in cmdline[0]. Tokenize across all cmdline entries.
  */
+function hasFlag(proc: ProcSnapshot, flag: string): boolean {
+  return proc.cmdline.join(' ').split(/\s+/).includes(flag);
+}
+
 function collectBrowserProcesses(rootPid: number, rootExe: string): ProcSnapshot[] {
   const all = new Map<number, ProcSnapshot>();
   for (const entry of fs.readdirSync('/proc')) {
@@ -116,14 +114,16 @@ try {
   assert.match(rootExe, /\/chromium_headless_shell-\d+\/chrome-headless-shell-linux64\/chrome-headless-shell$/);
 
   const tree = collectBrowserProcesses(procInfo.pid, rootExe);
-  const zygotes = tree.filter((p) => p.cmdline.some((arg) => arg === '--type=zygote' || arg.startsWith('--type=zygote ')));
-  const renderers = tree.filter((p) => p.cmdline.some((arg) => arg === '--type=renderer' || arg.startsWith('--type=renderer ')));
+  const sandboxHelpers = tree.filter((p) => p.name === 'chrome-sandbox' || p.cmdline[0]?.endsWith('/chrome-sandbox'));
+  const zygotes = tree.filter((p) => p.name !== 'chrome-sandbox' && hasFlag(p, '--type=zygote'));
+  const renderers = tree.filter((p) => hasFlag(p, '--type=renderer'));
   browserEvidence = {
     shouldEnableChromiumSandbox: shouldEnableChromiumSandbox(),
     rootPid: procInfo.pid,
     rootStartTime: procInfo.startTime,
     rootExe,
     screenshotBytes,
+    sandboxHelperCount: sandboxHelpers.length,
     zygoteCount: zygotes.length,
     rendererCount: renderers.length,
     processTree: tree,
@@ -133,9 +133,10 @@ try {
   const rootSnap = tree.find((p) => p.pid === procInfo.pid);
   assert.ok(rootSnap, 'Root Chromium process missing from /proc snapshot');
   for (const proc of tree) {
-    assert.equal(proc.cmdline.some((arg) => arg === '--no-sandbox' || arg.includes('--no-sandbox')), false, `Process ${proc.pid} has --no-sandbox`);
-    assert.equal(proc.cmdline.some((arg) => arg === '--disable-setuid-sandbox' || arg.includes('--disable-setuid-sandbox')), false, `Process ${proc.pid} has --disable-setuid-sandbox`);
+    assert.equal(hasFlag(proc, '--no-sandbox'), false, `Process ${proc.pid} has --no-sandbox`);
+    assert.equal(hasFlag(proc, '--disable-setuid-sandbox'), false, `Process ${proc.pid} has --disable-setuid-sandbox`);
   }
+  assert.ok(sandboxHelpers.length > 0, 'Expected active chrome-sandbox SUID helper process');
   assert.ok(zygotes.length > 0, 'Expected at least one --type=zygote process');
   assert.ok(renderers.length > 0, 'Expected at least one --type=renderer process');
   for (const renderer of renderers) {
