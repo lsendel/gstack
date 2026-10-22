@@ -14,6 +14,7 @@ def git(*args):
     return subprocess.check_output(['git','-C',str(repo),*args],text=True).strip()
 heads=git('bundle','unbundle',str(payload/'source.bundle')).splitlines()
 assert set(heads)=={manifest['source']+' HEAD',manifest['source']+' refs/heads/fix/pregate-literal-context',manifest['base']+' refs/heads/main'}
+git('remote','add','origin','https://github.com/garrytan/gstack.git')
 git('update-ref','refs/heads/main',manifest['base'])
 git('update-ref','refs/remotes/origin/main',manifest['base'])
 git('checkout','--detach',manifest['source'])
