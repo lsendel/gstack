@@ -15,6 +15,7 @@ def git(*args):
 heads=git('bundle','unbundle',str(payload/'source.bundle')).splitlines()
 assert set(heads)=={manifest['source']+' HEAD',manifest['source']+' refs/heads/fix/pregate-literal-context',manifest['base']+' refs/heads/main'}
 git('update-ref','refs/heads/main',manifest['base'])
+git('update-ref','refs/remotes/origin/main',manifest['base'])
 git('checkout','--detach',manifest['source'])
 assert git('rev-parse','HEAD')==manifest['source']
 assert git('rev-parse','HEAD^{tree}')==manifest['tree']

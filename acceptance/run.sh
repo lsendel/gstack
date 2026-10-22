@@ -5,12 +5,16 @@ work="${RUNNER_TEMP:?}/gstack-category-acceptance"
 evidence="${RUNNER_TEMP}/gstack-category-evidence"
 mkdir -p "$evidence"
 exec > >(tee "$evidence/run.log") 2>&1
+accept_tmp=""
 retain() {
   local status=$?
   trap - EXIT
   if test -d "$work/.context/free-test-logs"; then
     mkdir -p "$evidence/shards"
     find "$work/.context/free-test-logs" -maxdepth 1 -type f -name 'gstack-free-test-*.log' -exec cp -t "$evidence/shards/" {} + || status=1
+  fi
+  if test -n "$accept_tmp" && test -d "$accept_tmp"; then
+    rm -rf "$accept_tmp" || true
   fi
   printf '%s\n' "$status" > "$evidence/overall-exit.txt"
   exit "$status"
@@ -28,32 +32,65 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends fonts-noto-color-emoji xvfb xauth x11-utils poppler-utils zsh build-essential clang python3 python3-venv file unzip curl util-linux procps
 accept_home="$HOME/gstack-category-home-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
 mkdir -m 700 "$accept_home"
-mkdir -p -m 700 "$work/.context/acceptance-tmp"
+accept_tmp=$(mktemp -d /tmp/acc-tmp-XXXXXX)
+chmod 700 "$accept_tmp"
 # An allowlist prevents runner tokens/configuration and CI's no-sandbox heuristic
-# from reaching the free synthetic tests. HOME is private and outside /tmp.
+# from reaching the free synthetic tests. HOME is private and outside /tmp;
+# TMPDIR is a short private /tmp directory outside the git checkout under test.
 clean() {
   env -i HOME="$accept_home" ZDOTDIR="$accept_home" PATH="$PATH" LANG=C.UTF-8 \
-    TMPDIR="$work/.context/acceptance-tmp" TMP="$work/.context/acceptance-tmp" TEMP="$work/.context/acceptance-tmp" \
+    TMPDIR="$accept_tmp" TMP="$accept_tmp" TEMP="$accept_tmp" \
     PLAYWRIGHT_BROWSERS_PATH="$accept_home/.cache/ms-playwright" GSTACK_EXPECT_BINARIES=1 "$@"
 }
 cd "$work"
 clean git config --global user.name 'Gstack Acceptance Fixture'
 clean git config --global user.email acceptance@gstack.test
 clean git config --global init.defaultBranch main
+clean git config --global --add safe.directory '*'
 clean bun --no-env-file --config=/dev/null install --frozen-lockfile
 # System library installer is the pinned Playwright package, then browsers are
 # downloaded into the isolated home. No repository secrets enter either child.
 sudo env "PATH=$PATH" bun node_modules/playwright/cli.js install-deps chromium
 clean bun node_modules/playwright/cli.js install chromium
+python3 - <<'PY' > "$evidence/playwright-browsers.json"
+import json, pathlib
+data = json.loads(pathlib.Path("node_modules/playwright-core/browsers.json").read_text())
+by_name = {entry["name"]: entry for entry in data["browsers"]}
+chromium = by_name["chromium"]
+headless = by_name["chromium-headless-shell"]
+assert chromium["revision"] == headless["revision"], (chromium, headless)
+assert chromium["browserVersion"] == headless["browserVersion"], (chromium, headless)
+print(json.dumps({"chromium": chromium, "chromium-headless-shell": headless}, indent=2, sort_keys=True))
+PY
 chrome=$(clean bun -e 'import { chromium } from "playwright"; import { realpathSync } from "node:fs"; console.log(realpathSync(chromium.executablePath()))')
 case "$chrome" in "$accept_home"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome) ;; *) exit 1;; esac
-helper="${chrome%/*}/chrome_sandbox"
-installed="${chrome%/*}/chrome-sandbox"
+chrome_dir="${chrome%/*}"
+helper="$chrome_dir/chrome_sandbox"
+installed="$chrome_dir/chrome-sandbox"
 test -f "$helper" && test ! -L "$helper"
 # Same bundled sandbox helper installation as the supported upstream CI lane.
 sudo install -T -o root -g root -m 4755 "$helper" "$installed"
 test "$(stat -c '%u:%a' "$installed")" = 0:4755
 cmp -s "$helper" "$installed"
+test "$("$installed" --get-api)" = 1
+# Playwright's headless launch selects the paired chromium-headless-shell archive
+# built from the exact same Chrome for Testing revision and browserVersion.
+# Verify the shared release artifacts match before installing the SUID helper.
+shell_dirs=("$accept_home"/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64)
+test "${#shell_dirs[@]}" = 1
+shell_dir="${shell_dirs[0]}"
+test -f "$shell_dir/chrome-headless-shell"
+for shared_file in ABOUT deb.deps rpm.deps icudtl.dat v8_context_snapshot.bin libEGL.so libGLESv2.so; do
+  test -f "$chrome_dir/$shared_file"
+  test -f "$shell_dir/$shared_file"
+  cmp -s "$chrome_dir/$shared_file" "$shell_dir/$shared_file"
+done
+shell_helper="$shell_dir/chrome-sandbox"
+sudo install -T -o root -g root -m 4755 "$helper" "$shell_helper"
+test "$(stat -c '%u:%a' "$shell_helper")" = 0:4755
+cmp -s "$helper" "$shell_helper"
+test "$("$shell_helper" --get-api)" = 1
+sha256sum "$helper" "$installed" "$shell_helper" > "$evidence/sandbox-helpers-sha256.txt"
 clean bun --no-env-file --config=/dev/null run gen:skill-docs --host all
 clean bun --no-env-file --config=/dev/null run vendor:xterm
 clean bash browse/scripts/build-node-server.sh
@@ -63,9 +100,14 @@ git status --short > "$evidence/post-setup-status.txt"
 sha256sum browse/dist/browse make-pdf/dist/pdf lib/diagram-render/dist/diagram-render.html lib/diagram-render/dist/BUILD_INFO.json bin/gstack-cso-core bin/gstack-cso-launcher bin/gstack-cso-watchdog > "$evidence/build-sha256.txt"
 clean bash bin/gstack-wtree > "$evidence/tested-working-tree.txt"
 test -s "$evidence/tested-working-tree.txt"
-clean xvfb-run -a bun --no-env-file --config=/dev/null "$payload/browser-preflight.ts"
+clean env GSTACK_PREFLIGHT_EVIDENCE="$evidence/browser-preflight.json" xvfb-run -a bun --no-env-file --config=/dev/null "$payload/browser-preflight.ts"
+test -s "$evidence/browser-preflight.json"
 clean bun --no-env-file --config=/dev/null run typecheck
 clean bun --no-env-file --config=/dev/null run typecheck:test
+clean bun --no-env-file --config=/dev/null run format:cso:check
+clean env GSTACK_FREE_SEED_BASE=514fbfdc9799376edfd2536f60659501a48ead64 bun --no-env-file --config=/dev/null test test/free-seed-ratchet.test.ts
+docker --host unix:///var/run/docker.sock info >/dev/null
+clean env GSTACK_CSO_DOCKER_TESTS=1 DOCKER_HOST=unix:///var/run/docker.sock bun --no-env-file --config=/dev/null test --max-concurrency 1 test/cso-docker-integration.test.ts 2>&1 | tee "$evidence/cso-docker-integration.log"
 # No quick mode, file filter, retry downgrade, timeout override or skip override.
 set +e
 clean xvfb-run -a bun --no-env-file --config=/dev/null run test
@@ -76,5 +118,7 @@ clean bash bin/gstack-wtree > "$evidence/final-working-tree.txt"
 cmp "$evidence/tested-working-tree.txt" "$evidence/final-working-tree.txt"
 sha256sum -c "$evidence/build-sha256.txt"
 test "$(git rev-parse HEAD)" = 5ace6cf535399dc706241fac4b938319c43c54d0
+test "$(git rev-parse 'HEAD^{tree}')" = 5bad460e6481dd8ece05e1c1ba46e45df83d2d25
 git diff --stat > "$evidence/post-test-diff.txt"
+test ! -s "$evidence/post-test-diff.txt"
 exit "$result"
