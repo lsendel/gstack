@@ -6,7 +6,7 @@ and two local tooling/test-fixture repair commits. It includes no application
 source, user home, credentials, provider data, dependencies or generated local builds.
 
 `restore.py` verifies payload sizes and SHA-256 hashes, exactly two repair commits above the public base,
-source/tree identities and the byte-for-byte repair diff before execution.
+source/tree identities and the canonical repair diff hash (independent of format-patch version footers) before execution.
 The dedicated push workflow runs on an ordinary GitHub-hosted Ubuntu 24.04 VM.
 It preserves Chromium sandboxing and the complete strict free-suite runner;
 platform/optional-suite skips remain visible. It makes no paid model calls.

@@ -20,5 +20,6 @@ assert git('rev-parse','HEAD')==manifest['source']
 assert git('rev-parse','HEAD^{tree}')==manifest['tree']
 assert git('status','--porcelain')==''
 assert git('rev-list','--count',manifest['base']+'..HEAD')=='2'
-assert subprocess.check_output(['git','-C',str(repo),'format-patch','--stdout',manifest['base']+'..'+manifest['source']])==(payload/'repair.patch').read_bytes()
+diff=subprocess.check_output(['git','-C',str(repo),'diff','--no-ext-diff','--no-textconv','--no-renames','--binary','--full-index',manifest['base'],manifest['source']])
+assert hashlib.sha256(diff).hexdigest()==manifest['repairDiffSha256']
 print(json.dumps({'source':manifest['source'],'tree':manifest['tree'],'payload_verified':True},sort_keys=True))
