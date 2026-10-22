@@ -1,0 +1,33 @@
+name: Isolated category gate tooling acceptance
+on:
+  push:
+    branches: [category-gate-acceptance-5ace6cf]
+permissions:
+  contents: read
+concurrency:
+  group: category-gate-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  strict-linux-acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - name: Verify payload, preflight sandbox and run full strict acceptance
+        run: bash acceptance/run.sh
+      - name: Retain acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gstack-category-acceptance-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gstack-category-evidence
+          if-no-files-found: error
+          retention-days: 14

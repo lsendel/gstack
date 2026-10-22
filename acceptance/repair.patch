@@ -1,0 +1,549 @@
+From a34a27d1a34afea0b35f1085be571a4e982ce96f Mon Sep 17 00:00:00 2001
+From: Luis Diaz Sendel <471802+lsendel@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 18:31:16 -0400
+Subject: [PATCH 1/2] fix(pregate): tie generic stale literals to source
+ consumers
+
+---
+ lib/pregate/checks/literals.ts    | 78 ++++++++++++++++++++++--
+ test/helpers/pregate-fixture.ts   |  6 +-
+ test/pregate-guards.test.ts       |  8 +--
+ test/pregate-invalidation.test.ts |  2 +-
+ test/pregate-remote.test.ts       |  2 +-
+ test/pregate-selection.test.ts    | 98 ++++++++++++++++++++++++++-----
+ test/pregate-supervise.test.ts    | 16 ++---
+ 7 files changed, 176 insertions(+), 34 deletions(-)
+
+diff --git a/lib/pregate/checks/literals.ts b/lib/pregate/checks/literals.ts
+index bca67b4..27bdaab 100644
+--- a/lib/pregate/checks/literals.ts
++++ b/lib/pregate/checks/literals.ts
+@@ -10,7 +10,7 @@ import { spawnSync } from 'node:child_process';
+ import * as fs from 'node:fs';
+ import * as path from 'node:path';
+ import { baseInputs, sha256 } from '../context';
+-import { isTestFile, listRepoFiles, scansLiterals } from '../import-graph';
++import { buildGraph, isTestFile, listRepoFiles, scansLiterals, type Graph } from '../import-graph';
+ import type { CheckDef, CheckResult, PregateContext } from '../types';
+ 
+ export interface ChangedLiteral { name: string; old: string; new: string; file: string }
+@@ -59,17 +59,86 @@ export function changedLiterals(file: string, oldText: string, newText: string):
+ function escape(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+ function unquote(v: string): string { return /^['"`]/.test(v) ? v.slice(1, -1) : v; }
+ 
+-/** Test files that still carry the old literal beside the constant's name or its module stem. */
+-export function consumersOf(repoRoot: string, testFiles: readonly string[], change: ChangedLiteral): string[] {
++/** Find the closing parenthesis without treating nested calls or quoted delimiters as boundaries. */
++function callEnd(text: string, open: number): number {
++  let depth = 0;
++  let quote = '';
++  for (let i = open; i < text.length; i++) {
++    const c = text[i]!;
++    if (quote) {
++      if (c === '\\') i++;
++      else if (c === quote) quote = '';
++      continue;
++    }
++    if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
++    if (c === '/' && text[i + 1] === '/') { const next = text.indexOf('\n', i); if (next < 0) return -1; i = next; continue; }
++    if (c === '/' && text[i + 1] === '*') { const next = text.indexOf('*/', i + 2); if (next < 0) return -1; i = next + 1; continue; }
++    if (c === '(') depth++;
++    else if (c === ')' && --depth === 0) return i;
++  }
++  return -1;
++}
++
++/** Generic option names are not identities: require an associated value, not file-wide co-occurrence. */
++function optionValueLines(text: string, change: ChangedLiteral): Set<number> {
++  const name = new RegExp(`\\b${escape(change.name)}\\b`);
++  const value = new RegExp(`(?<![\\w.])${escape(unquote(change.old))}(?![\\w.])`, 'g');
++  const lines = new Set<number>();
++  const add = (fragment: string, start: number) => {
++    for (const match of fragment.matchAll(value)) lines.add(text.slice(0, start + match.index!).split('\n').length);
++  };
++  const assignment = new RegExp(`\\b${escape(change.name)}\\b["']?\\s*(?::|={1,3}|!==?|>=?|<=?)\\s*(?<![\\w.])${escape(unquote(change.old))}(?![\\w.])`, 'g');
++  for (const match of text.matchAll(assignment)) add(match[0], match.index!);
++  // Parse assertion calls with balanced operands, e.g. expect(getOptions().limit).toBe(10000).
++  for (const match of text.matchAll(/\b(expect|assert(?:\.[a-zA-Z]+)?)\s*\(/g)) {
++    const open = match.index! + match[0].lastIndexOf('(');
++    const end = callEnd(text, open);
++    if (end < 0) { if (name.test(text.slice(open))) add(text.slice(open), open); continue; }
++    const operand = text.slice(open + 1, end);
++    if (!name.test(operand)) continue;
++    if (match[1] !== 'expect') { add(operand, open + 1); continue; }
++    const matcher = /^\s*(?:\.[a-zA-Z]+\s*)+\(/.exec(text.slice(end + 1));
++    if (!matcher) continue;
++    const expectedOpen = end + 1 + matcher[0].lastIndexOf('(');
++    const expectedEnd = callEnd(text, expectedOpen);
++    add(text.slice(expectedOpen + 1, expectedEnd < 0 ? undefined : expectedEnd), expectedOpen + 1);
++  }
++  return lines;
++}
++
++/** Helpers/fixtures also carry expectations; do not restrict provenance to runnable test files. */
++function literalConsumers(graph: Graph, file: string): Set<string> {
++  const seen = new Set<string>([file]);
++  const queue = [file];
++  const dirs = [...graph.reverse.keys()].filter(key => key.endsWith('/**'));
++  for (let i = 0; i < queue.length; i++) {
++    const node = queue[i]!;
++    const edges = [...(graph.reverse.get(node) ?? [])];
++    for (const dir of dirs) if (node.startsWith(dir.slice(0, -3) + '/')) edges.push(...(graph.reverse.get(dir) ?? []));
++    for (const edge of edges) if (!seen.has(edge.from)) { seen.add(edge.from); queue.push(edge.from); }
++  }
++  return seen;
++}
++
++/** Exported symbols retain the whole-tree scan; generic option names need source provenance. */
++export function consumersOf(repoRoot: string, testFiles: readonly string[], change: ChangedLiteral, related?: Set<string>): string[] {
+   const value = unquote(change.old);
+   const valueRe = /^-?\d/.test(value) ? new RegExp(`(?<![\\w.])${escape(value)}(?![\\w.])`) : new RegExp(`['"\`]${escape(value)}['"\`]`);
+   const stem = path.basename(change.file).replace(/\.[^.]+$/, '');
+   const nameRe = new RegExp(`\\b${escape(change.name)}\\b`);
+   const hits: string[] = [];
++  const generic = /^[a-z]/.test(change.name);
++  const consumers = generic ? related ?? literalConsumers(buildGraph(repoRoot), change.file) : undefined;
+   for (const rel of testFiles) {
+     let text: string;
+     try { text = fs.readFileSync(path.join(repoRoot, rel), 'utf8'); } catch { continue; }
+     if (!(nameRe.test(text) || text.includes(stem))) continue;
++    // Explicit source references remain conservative, including subprocess/shell consumers.
++    if (generic && !text.includes(stem)) {
++      if (!consumers!.has(rel)) continue;
++      for (const line of optionValueLines(text, change)) hits.push(`${rel}:${line}`);
++      continue;
++    }
+     const lines = text.split('\n');
+     for (let i = 0; i < lines.length; i++) if (valueRe.test(lines[i]!)) { hits.push(`${rel}:${i + 1}`); break; }
+   }
+@@ -90,8 +159,9 @@ function run(ctx: PregateContext): CheckResult {
+   if (!changes.length) return { id: 'literals', stage: 'preflight', status: 'pass', inputs, detail: `no exported constant or named timeout literal changed in ${candidates.length} modified source file(s)` };
+   const testFiles = listRepoFiles(ctx.repoRoot).filter(f => scansLiterals(f) && !f.startsWith('bin/'));
+   const lines: string[] = [];
++  const graph = changes.some(c => /^[a-z]/.test(c.name)) ? buildGraph(ctx.repoRoot, { declarations: ctx.config.dependencies }) : undefined;
+   for (const c of changes) {
+-    const hits = consumersOf(ctx.repoRoot, testFiles, c);
++    const hits = consumersOf(ctx.repoRoot, testFiles, c, graph ? literalConsumers(graph, c.file) : undefined);
+     ctx.explain.push(`literals: ${c.file} ${c.name} ${c.old} → ${c.new}: ${hits.length} test file(s) still carry ${c.old}`);
+     for (const h of hits) lines.push(`${h}: ${c.name} still ${c.old} (now ${c.new} in ${c.file})`);
+   }
+diff --git a/test/helpers/pregate-fixture.ts b/test/helpers/pregate-fixture.ts
+index 94d0b3a..e48108a 100644
+--- a/test/helpers/pregate-fixture.ts
++++ b/test/helpers/pregate-fixture.ts
+@@ -80,7 +80,7 @@ jobs:
+         run: node --test \${{ matrix.files }}
+ `;
+ 
+-export function makeFixtureRepo(opts: { registry?: Record<string, unknown> | null; pregate?: Record<string, unknown> | null; prefix?: string; baseFiles?: Record<string, string> } = {}): FixtureRepo {
++export function makeFixtureRepo(opts: { registry?: Record<string, unknown> | null; pregate?: Record<string, unknown> | null; prefix?: string; baseFiles?: Record<string, string>; localUnitLane?: boolean } = {}): FixtureRepo {
+   const root = fs.mkdtempSync(path.join(os.tmpdir(), opts.prefix ?? 'gstack-pregate-fx-'));
+   const origin = path.join(root, 'origin.git');
+   const work = path.join(root, 'work');
+@@ -119,7 +119,9 @@ export function makeFixtureRepo(opts: { registry?: Record<string, unknown> | nul
+   write(work, 'Makefile', 'all:\n\ttrue\n');
+   write(work, 'package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', scripts: { test: 'node --test test/*.test.js', generate: 'node gen.js' } }, null, 2) + '\n');
+   write(work, '.gitignore', 'node_modules/\n.gstack/tmp/\n');
+-  write(work, '.github/workflows/free-tests.yml', WORKFLOW_UNIT);
++  // Tests of local execution may select the host lane; platform tests retain the fixed Linux fixture.
++  const unitRunner = process.platform === 'darwin' ? 'macos-latest' : process.platform === 'win32' ? 'windows-latest' : 'ubuntu-24.04';
++  write(work, '.github/workflows/free-tests.yml', opts.localUnitLane ? WORKFLOW_UNIT.replace('ubuntu-24.04', unitRunner) : WORKFLOW_UNIT);
+   write(work, '.github/workflows/windows.yml', WORKFLOW_WINDOWS);
+   if (opts.registry !== null) write(work, '.gstack/generated.json', JSON.stringify(opts.registry ?? BASE_REGISTRY, null, 2) + '\n');
+   if (opts.pregate !== null) write(work, '.gstack/pregate.json', JSON.stringify(opts.pregate ?? BASE_PREGATE, null, 2) + '\n');
+diff --git a/test/pregate-guards.test.ts b/test/pregate-guards.test.ts
+index 7719b9e..1f83e9d 100644
+--- a/test/pregate-guards.test.ts
++++ b/test/pregate-guards.test.ts
+@@ -50,7 +50,7 @@ const SERIAL_TEST = "const test = require('node:test');\ntest('serial', () => {}
+ 
+ /** The base branch gains the manifest, its check script and the given pregate config. */
+ function guardedFixture(pregate: Record<string, unknown>): FixtureRepo {
+-  const repo = makeFixtureRepo({ pregate });
++  const repo = makeFixtureRepo({ localUnitLane: true, pregate });
+   repos.push(repo);
+   repo.git('checkout', '-q', 'main');
+   write(repo.work, 'scripts/check-serial.js', CHECK_SERIAL);
+@@ -198,7 +198,7 @@ describe('pregate config: sealed (CD4)', () => {
+ 
+ describe('gstack-pregate flags (CD1)', () => {
+   test('an unknown flag is usage (exit 2) on every verb instead of a silent normal run', () => {
+-    const repo = makeFixtureRepo(); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true }); repos.push(repo);
+     const bogus = runBin(repo, 'gstack-pregate', ['run', '--base', 'main', '--bogus']);
+     expect(bogus.status).toBe(EXIT.usage);
+     expect(bogus.err).toContain('unknown flag --bogus');
+@@ -215,7 +215,7 @@ describe('lanes runtime and serial files (CD1)', () => {
+ 
+   test('on a Capy-shaped host the lanes runner gets the verified Bun from $HOME/.bun/bin, not the older PATH Bun', () => {
+     const host = capyHost({ verifiedBun: '1.4.2' }); hosts.push(host);
+-    const repo = makeFixtureRepo({ pregate: { ...BASE_PREGATE, runner: recordingRunner } }); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true, pregate: { ...BASE_PREGATE, runner: recordingRunner } }); repos.push(repo);
+     commit(repo, { 'lib/util.js': "exports.add = (a, b) => a + b + 0;\n" });
+     const r = pregate(repo, ['--allow-repo-commands', '--stage', 'tests'], host.env);
+     expect(r.status).toBe(EXIT.ok);
+@@ -225,7 +225,7 @@ describe('lanes runtime and serial files (CD1)', () => {
+   });
+ 
+   test('serial-pattern test files run in their own process, apart from the unit files', () => {
+-    const repo = makeFixtureRepo({ pregate: { ...BASE_PREGATE, runner: recordingRunner } }); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true, pregate: { ...BASE_PREGATE, runner: recordingRunner } }); repos.push(repo);
+     commit(repo, { 'lib/util.js': "exports.add = (a, b) => a + b + 0;\n", 'test/widget-env.serial.test.js': "const test = require('node:test');\ntest('serial', () => {});\n" });
+     const r = pregate(repo, ['--allow-repo-commands', '--stage', 'tests']);
+     expect(r.status).toBe(EXIT.ok);
+diff --git a/test/pregate-invalidation.test.ts b/test/pregate-invalidation.test.ts
+index 731d189..7091e1b 100644
+--- a/test/pregate-invalidation.test.ts
++++ b/test/pregate-invalidation.test.ts
+@@ -12,7 +12,7 @@ import { EXIT } from '../lib/headless-artifacts';
+ import { cleanup, commit, makeFixtureRepo, runBin, write, type FixtureRepo } from './helpers/pregate-fixture';
+ 
+ const repos: FixtureRepo[] = [];
+-const fixture = () => { const r = makeFixtureRepo(); repos.push(r); return r; };
++const fixture = () => { const r = makeFixtureRepo({ localUnitLane: true }); repos.push(r); return r; };
+ afterEach(() => { while (repos.length) cleanup(repos.pop()!); });
+ const run = (repo: FixtureRepo, args: string[]) => runBin(repo, 'gstack-pregate', ['--base', 'main', '--allow-repo-commands', ...args]);
+ const outFile = (repo: FixtureRepo) => path.join(repo.work, '.gstack/tmp/pregate.json');
+diff --git a/test/pregate-remote.test.ts b/test/pregate-remote.test.ts
+index 5c2dc80..8b1aff4 100644
+--- a/test/pregate-remote.test.ts
++++ b/test/pregate-remote.test.ts
+@@ -28,7 +28,7 @@ const GATE_SCRIPT = [
+ ].join('\n') + '\n';
+ 
+ function gated(pregate: Record<string, unknown> = { ...BASE_PREGATE, remote_gate: GATE }): FixtureRepo {
+-  const repo = makeFixtureRepo({ pregate });
++  const repo = makeFixtureRepo({ localUnitLane: true, pregate });
+   repos.push(repo);
+   repo.git('checkout', '-q', 'main');
+   commit(repo, { 'scripts/remote-gate.js': GATE_SCRIPT }, 'remote gate');
+diff --git a/test/pregate-selection.test.ts b/test/pregate-selection.test.ts
+index 59404fd..5c15f2b 100644
+--- a/test/pregate-selection.test.ts
++++ b/test/pregate-selection.test.ts
+@@ -22,6 +22,8 @@ import { CHECK_IDS } from '../lib/pregate/index';
+ import { parseWorkflow } from '../lib/pregate/workflows';
+ import { BASE_PREGATE, cleanup, commit, makeFixtureRepo, runBin, write, type FixtureRepo } from './helpers/pregate-fixture';
+ 
++const host = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux';
++const unitStatus = host === 'linux' ? 'pass' : 'requires-remote';
+ const repos: FixtureRepo[] = [];
+ const fixture = (opts?: Parameters<typeof makeFixtureRepo>[0]) => { const r = makeFixtureRepo(opts); repos.push(r); return r; };
+ afterEach(() => { while (repos.length) cleanup(repos.pop()!); });
+@@ -221,18 +223,19 @@ describe('gstack-pregate (bin)', () => {
+     expect(r.out).toMatch(/^preflight {2}strays {4}pass /m);
+     expect(r.out).toMatch(/^preflight {2}literals {2}pass /m);
+     expect(r.out).toMatch(/^preflight {2}guards {4}pass .*no guards declared/m);
+-    expect(r.out).toMatch(/^tests {6}lanes {5}pass .*1 tests ran in 1 file\(s\), exit 0/m);
++    expect(r.out).toMatch(new RegExp(`^tests {6}lanes {5}${unitStatus} .*1 tests ran in 1 file\\(s\\), exit 0`, 'm'));
+     expect(r.out).toMatch(/^stage 1 \(mechanical preflight\): \d+ ms$/m);
+     expect(r.out).toMatch(/^stage 2 \(test execution\): \d+ ms$/m);
+-    expect(r.out).toContain('Tiers ran: unit; requires-remote: none');
++    expect(r.out).toContain(`Tiers ran: unit; requires-remote: ${host === 'linux' ? 'none' : 'linux'}`);
+     expect(r.out).toMatch(/GSTACK_RESULT: skill=pregate status=complete run=.*pregate\.json/);
+     const out = readOut(repo);
+     expect(out.schema_version).toBe(1);
+     expect(out.tree).toMatch(/^[0-9a-f]{40}$/);
+-    expect(out.checks.map((c: any) => [c.id, c.status, c.stage])).toEqual([['regen', 'pass', 'preflight'], ['secrets', 'pass', 'preflight'], ['strays', 'pass', 'preflight'], ['literals', 'pass', 'preflight'], ['timing', 'pass', 'preflight'], ['guards', 'pass', 'preflight'], ['lanes', 'pass', 'tests']]);
++    expect(out.checks.map((c: any) => [c.id, c.status, c.stage])).toEqual([['regen', 'pass', 'preflight'], ['secrets', 'pass', 'preflight'], ['strays', 'pass', 'preflight'], ['literals', 'pass', 'preflight'], ['timing', 'pass', 'preflight'], ['guards', 'pass', 'preflight'], ['lanes', unitStatus, 'tests']]);
+     for (const c of out.checks) { expect(c.inputs.tree).toBe(out.tree); expect(typeof c.ms).toBe('number'); }
+     expect(check(repo, 'lanes').inputs.command).toMatch(/^[0-9a-f]{64}$/);
+-    expect(out.verdict).toBe('pass');
++    expect(out.verdict).toBe(host === 'linux' ? 'pass' : 'requires-remote (1 uncleared)');
++    expect(out.requires_remote).toEqual(host === 'linux' ? [] : [{ lane: 'free-tests.yml/unit', platform: 'linux', workflow: 'free-tests.yml', job: 'unit', tests: ['test/util.test.js'], receipt: null }]);
+     expect(runBin(repo, 'gstack-artifact', ['validate', path.join(repo.work, '.gstack/tmp/pregate.json'), '--as', 'pregate']).status).toBe(EXIT.ok);
+   });
+ 
+@@ -296,6 +299,68 @@ describe('gstack-pregate (bin)', () => {
+     expect(pregate(repo, ['--stage', 'preflight', '--only', 'literals']).status).toBe(EXIT.ok);
+   });
+ 
++  // Value: protects=generic option names cannot link unrelated identifiers and numbers;
++  // fails_when=the literal gate treats file-wide co-occurrence as a stale category limit;
++  // why_new=replays the family category pagination false positive through the registered check;
++  // seam=temporary repo only; no_claim=arbitrary dynamic-language dataflow.
++  test('generic options require source provenance and a named value, while actual consumers still block', () => {
++    const repo = fixture({ baseFiles: {
++      'lib/category.js': 'exports.options = { limit: 10000 };\n',
++      'lib/barrel.js': "module.exports = require('./category.js');\n",
++      'test/indirect.test.js': "const {options} = require('../lib/barrel.js');\nconst limit = 5;\nconst license = `ID-${10000 + 1}`;\nconst request = { ssrTimeoutMs: 10000 };\n",
++      'test/unrelated.test.js': 'const config = { limit: 10000 };\n',
++      'scripts/unrelated.sh': 'limit=10000\n',
++    } });
++    commit(repo, { 'lib/category.js': 'exports.options = { limit: 200 };\n' });
++    expect(pregate(repo, ['--stage', 'preflight', '--only', 'literals']).status).toBe(EXIT.ok);
++    commit(repo, {
++      'test/indirect.test.js': "const {options} = require('../lib/barrel.js');\nexpect(options.limit)\n.toBe(\n10000);\n",
++    });
++    const stale = pregate(repo, ['--stage', 'preflight', '--only', 'literals']);
++    expect(stale.status).toBe(EXIT.fail);
++    expect(stale.out).toContain('test/indirect.test.js:4: limit still 10000');
++    commit(repo, { 'test/indirect.test.js': "const {options} = require('../lib/barrel.js');\nexpect(options.limit).toBe(200);\n" });
++    expect(pregate(repo, ['--stage', 'preflight', '--only', 'literals']).status).toBe(EXIT.ok);
++  });
++
++  // Value: protects=provenance declarations and explicit subprocess references retain coverage;
++  // fails_when=generic-name filtering drops multiline options or direct source references;
++  // why_new=negative control for the provenance restriction; seam=temporary repo only.
++  test('generic option guards retain nested assertion operands and imported helper fixtures', () => {
++    const repo = fixture({ baseFiles: {
++      'lib/category.js': 'exports.options = { limit: 10000 };\n',
++      'lib/index.js': "module.exports = require('./category.js');\n",
++    } });
++    commit(repo, {
++      'lib/category.js': 'exports.options = { limit: 200 };\n',
++      'test/nested.test.js': "const { getOptions } = require('../lib/index.js');\nexpect(getOptions().limit).toBe(10000);\nassert.equal(getOptions().limit, 10000);\n",
++      'test/helpers/options.js': "const api = require('../../lib/index.js');\nmodule.exports = { limit: 10000 };\n",
++      'test/helper-consumer.test.js': "const fixture = require('./helpers/options.js');\n",
++    });
++    const result = pregate(repo, ['--stage', 'preflight', '--only', 'literals']);
++    expect(result.status).toBe(EXIT.fail);
++    expect(result.out).toContain('test/nested.test.js:2: limit still 10000');
++    expect(result.out).toContain('test/nested.test.js:3: limit still 10000');
++    expect(result.out).toContain('test/helpers/options.js:2: limit still 10000');
++  });
++
++  test('generic option guards retain declared, multiline, comparison and subprocess consumers', () => {
++    const repo = fixture({ pregate: { ...BASE_PREGATE, dependencies: {
++      ...BASE_PREGATE.dependencies, 'lib/category.js': ['test/dynamic.test.js'],
++    } }, baseFiles: { 'lib/category.js': 'exports.options = { limit: 10000 };\n' } });
++    commit(repo, {
++      'lib/category.js': 'exports.options = { limit: 200 };\n',
++      'test/dynamic.test.js': 'const expected = { limit:\n  10000 };\nassert.equal(actual.limit, 10000);\nif (actual.limit === 10000) throw Error();\n',
++      'scripts/explicit.sh': '# calls category.js in another process\nEXPECTED=10000\n',
++    });
++    const result = pregate(repo, ['--stage', 'preflight', '--only', 'literals']);
++    expect(result.status).toBe(EXIT.fail);
++    expect(result.out).toContain('test/dynamic.test.js:2: limit still 10000');
++    expect(result.out).toContain('test/dynamic.test.js:3: limit still 10000');
++    expect(result.out).toContain('test/dynamic.test.js:4: limit still 10000');
++    expect(result.out).toContain('scripts/explicit.sh:2: limit still 10000');
++  });
++
+   test('secrets: a credential in an added line fails and cannot be downgraded; a committed-then-removed line is clean', () => {
+     const repo = fixture({ pregate: { ...BASE_PREGATE, warn: ['secrets'] } });
+     const bad = pregate(repo, ['--stage', 'preflight', '--only', 'secrets']);
+@@ -416,7 +481,7 @@ describe('gstack-pregate (bin)', () => {
+     const head = pregate(repo, ['--stage', 'tests', '--policy-from', 'head']);
+     expect(head.status).toBe(EXIT.ok);
+     expect(head.out).toContain('policy head (unreviewed) .gstack/pregate.json');
+-    expect(head.out).toMatch(/^tests {6}lanes {5}pass /m);
++    expect(head.out).toMatch(new RegExp(`^tests {6}lanes {5}${unitStatus} `, 'm'));
+   });
+ 
+   test('lanes: deleted and renamed files select the tests that named them; subprocess targets and computed reads map through declarations and joined literals', () => {
+@@ -440,19 +505,24 @@ describe('gstack-pregate (bin)', () => {
+     commit(repo, { 'test/windows-paths.test.js': "const test = require('node:test');\ntest('windows paths', () => { /* touched */ });\n" });
+     const r = pregate(repo, ['--stage', 'tests', '--explain']);
+     expect(r.status).toBe(EXIT.ok);
+-    expect(r.out).toMatch(/^tests {6}lanes {5}requires-remote .*1 requires-remote obligation\(s\)/m);
+-    expect(r.out).toContain('requires-remote windows.yml/windows-shard (windows): 1 test(s) — test/windows-paths.test.js');
+-    expect(r.out).toContain('Tiers ran: unit; requires-remote: windows');
++    const owed = [
++      { lane: 'free-tests.yml/unit', platform: 'linux', workflow: 'free-tests.yml', job: 'unit', tests: ['test/windows-paths.test.js'], receipt: null },
++      { lane: 'windows.yml/windows-shard', platform: 'windows', workflow: 'windows.yml', job: 'windows-shard', tests: ['test/windows-paths.test.js'], receipt: null },
++    ].filter(o => o.platform !== host);
++    expect(r.out).toMatch(new RegExp(`^tests {6}lanes {5}requires-remote .*${owed.length} requires-remote obligation\\(s\\)`, 'm'));
++    for (const obligation of owed) expect(r.out).toContain(`requires-remote ${obligation.lane} (${obligation.platform}): 1 test(s) — test/windows-paths.test.js`);
++    expect(r.out).toContain(`Tiers ran: unit; requires-remote: ${owed.map(o => o.platform).join(' ')}`);
+     expect(r.out).toContain('lane windows.yml/windows-shard: 1 files from manifest `node scripts/windows-list.js`');
+-    expect(r.out).toContain('PREGATE: requires-remote (1 uncleared)');
++    expect(r.out).toContain(`PREGATE: requires-remote (${owed.length} uncleared)`);
+     const out = readOut(repo);
+-    expect(out.requires_remote).toEqual([{ lane: 'windows.yml/windows-shard', platform: 'windows', workflow: 'windows.yml', job: 'windows-shard', tests: ['test/windows-paths.test.js'], receipt: null }]);
++    expect(out.requires_remote).toEqual(owed);
+     // Without a manifest the planner-computed matrix is an unsupported expression: every selected test is conservatively in the lane.
+     const bare = fixture({ pregate: { ...BASE_PREGATE, selection: {} } });
+     commit(bare, { 'lib/util.js': "exports.add = (a, b) => a + b + 0;\n" });
+     const b = pregate(bare, ['--stage', 'tests', '--explain']);
+     expect(b.out).toContain('unsupported workflow expression "${{ fromJSON(needs.windows-plan.outputs.matrix) }}" and no selection manifest; treated as unknown');
+-    expect(b.out).toContain('requires-remote windows.yml/windows-shard (windows): 1 test(s) — test/util.test.js');
++    if (host !== 'windows') expect(b.out).toContain('requires-remote windows.yml/windows-shard (windows): 1 test(s) — test/util.test.js');
++    else expect(readOut(bare).requires_remote).toEqual([{ lane: 'free-tests.yml/unit', platform: 'linux', workflow: 'free-tests.yml', job: 'unit', tests: ['test/util.test.js'], receipt: null }]);
+   });
+ 
+   test('p0-4-pipe-hidden-failure: a runner whose failure hides behind | tail is red under pipefail; a zero-run lane is red with exit 0', () => {
+@@ -501,9 +571,9 @@ describe('gstack-pregate (bin)', () => {
+   test('lanes prints the lane list with platform tiers; validate and init cover the working-tree config', () => {
+     const repo = fixture();
+     const l = runBin(repo, 'gstack-pregate', ['lanes']);
+-    expect(l.out).toContain('free-tests.yml/unit: tier=unit platform=linux runs-on=ubuntu-24.04 tests=yes (.github/workflows/free-tests.yml:4)');
+-    expect(l.out).toContain('windows.yml/windows-shard: tier=platform platform=windows runs-on=windows-latest tests=yes matrix="${{ fromJSON(needs.windows-plan.outputs.matrix) }}"');
+-    expect(l.out).toMatch(/^LANES: 3 jobs; tests 2; platform 1$/m);
++    expect(l.out).toContain(`free-tests.yml/unit: tier=${host === 'linux' ? 'unit' : 'platform'} platform=linux runs-on=ubuntu-24.04 tests=yes (.github/workflows/free-tests.yml:4)`);
++    expect(l.out).toContain(`windows.yml/windows-shard: tier=${host === 'windows' ? 'unit' : 'platform'} platform=windows runs-on=windows-latest tests=yes matrix="\${{ fromJSON(needs.windows-plan.outputs.matrix) }}"`);
++    expect(l.out).toContain(`LANES: 3 jobs; tests 2; platform ${host === 'linux' ? 1 : host === 'windows' ? 2 : 3}`);
+     expect(runBin(repo, 'gstack-pregate', ['validate']).out).toContain('PREGATE_CONFIG_VALID: .gstack/pregate.json');
+     write(repo.work, '.gstack/pregate.json', '{"warn": ["secrets"]}\n');
+     const v = runBin(repo, 'gstack-pregate', ['validate']);
+diff --git a/test/pregate-supervise.test.ts b/test/pregate-supervise.test.ts
+index abdf390..4e3895a 100644
+--- a/test/pregate-supervise.test.ts
++++ b/test/pregate-supervise.test.ts
+@@ -132,7 +132,7 @@ describe('supervise: per-file progress adapters', () => {
+ 
+ describe('withFingerprint over async checks', () => {
+   test('a rejected check promise is incomplete, never pass', async () => {
+-    const repo = makeFixtureRepo(); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true }); repos.push(repo);
+     const loaded = buildContext({ repoRoot: repo.work, base: 'main', policyFrom: 'base', allowRepoCommands: false, env: { ...process.env, ...repo.env }, testBackend: 'local', cores: 16 });
+     if (!('ctx' in loaded)) throw new Error('fixture context refused');
+     const r = await withFingerprint(loaded.ctx, 'lanes', 'tests', async () => { throw new Error('runner vanished'); });
+@@ -147,7 +147,7 @@ describe('gstack-pregate: the test stage never hangs silently', () => {
+   const lanes = (repo: FixtureRepo) => JSON.parse(fs.readFileSync(path.join(repo.work, '.gstack/tmp/pregate.json'), 'utf8')).checks.find((c: any) => c.id === 'lanes');
+ 
+   test('a test that blocks forever is killed at the stall timeout, named, and recorded incomplete; --json stdout stays one JSON document', () => {
+-    const repo = makeFixtureRepo(); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true }); repos.push(repo);
+     commit(repo, { 'test/hang.test.js': NODE_HANG });
+     const started = Date.now();
+     const r = pregate(repo, ['--stall-timeout', '2', '--json']);
+@@ -164,7 +164,7 @@ describe('gstack-pregate: the test stage never hangs silently', () => {
+   }, 90_000);
+ 
+   test('the base branch stall_timeout_s applies without the flag', () => {
+-    const repo = makeFixtureRepo({ pregate: { ...BASE_PREGATE, stall_timeout_s: 2 } }); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true, pregate: { ...BASE_PREGATE, stall_timeout_s: 2 } }); repos.push(repo);
+     commit(repo, { 'test/hang.test.js': NODE_HANG });
+     const r = pregate(repo, []);
+     expect(r.status).toBe(EXIT.fail);
+@@ -174,7 +174,7 @@ describe('gstack-pregate: the test stage never hangs silently', () => {
+   }, 90_000);
+ 
+   test('a test whose child backgrounds and holds stdout passes promptly instead of waiting out --timeout', () => {
+-    const repo = makeFixtureRepo({ pregate: { ...BASE_PREGATE, runner: 'node {files}' } }); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true, pregate: { ...BASE_PREGATE, runner: 'node {files}' } }); repos.push(repo);
+     commit(repo, { 'test/bg.test.js': NODE_BACKGROUND });
+     const started = Date.now();
+     const r = pregate(repo, ['--timeout', '90']);
+@@ -185,7 +185,7 @@ describe('gstack-pregate: the test stage never hangs silently', () => {
+   }, 90_000);
+ 
+   test('--timeout bounds each runner process: serial files that each fit run to a pass even when their total exceeds it; one that overruns is incomplete', () => {
+-    const repo = makeFixtureRepo(); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true }); repos.push(repo);
+     const slow = "const test = require('node:test');\ntest('slow', async () => { await new Promise(r => setTimeout(r, 1500)); });\n";
+     commit(repo, { 'test/a.serial.test.js': slow, 'test/b.serial.test.js': slow, 'test/c.serial.test.js': slow });
+     const r = pregate(repo, ['--timeout', '3']);
+@@ -199,11 +199,11 @@ describe('gstack-pregate: the test stage never hangs silently', () => {
+   }, 90_000);
+ 
+   test('a late tree mutation by a test\'s child is caught while the check runs, and a leftover child cannot mutate the tree after it', async () => {
+-    const during = makeFixtureRepo(); repos.push(during);
++    const during = makeFixtureRepo({ localUnitLane: true }); repos.push(during);
+     commit(during, { 'test/mutate.test.js': "const test = require('node:test');\nconst { spawn } = require('node:child_process');\ntest('mutates soon', async () => { spawn('sh', ['-c', 'sleep 0.3; echo changed >> README.md'], { stdio: 'ignore' }); await new Promise(r => setTimeout(r, 1500)); });\n" });
+     expect(pregate(during, []).status).toBe(EXIT.fail);
+     expect(lanes(during).detail).toContain('working tree changed during the check');
+-    const after = makeFixtureRepo(); repos.push(after);
++    const after = makeFixtureRepo({ localUnitLane: true }); repos.push(after);
+     commit(after, { 'test/leftover.test.js': "const test = require('node:test');\nconst { spawn } = require('node:child_process');\ntest('leaves a child', () => { spawn('sh', ['-c', 'sleep 2; echo changed >> README.md'], { stdio: 'ignore' }).unref(); });\n" });
+     expect(pregate(after, []).status).toBe(EXIT.ok);
+     await Bun.sleep(2500);
+@@ -211,7 +211,7 @@ describe('gstack-pregate: the test stage never hangs silently', () => {
+   }, 90_000);
+ 
+   test('SIGTERM to pregate kills the running test process group, exits 143 and writes no pregate.json', async () => {
+-    const repo = makeFixtureRepo(); repos.push(repo);
++    const repo = makeFixtureRepo({ localUnitLane: true }); repos.push(repo);
+     commit(repo, { 'test/hang.test.js': NODE_HANG });
+     const child = spawn(BIN('gstack-pregate'), ['--base', 'main', '--allow-repo-commands', '--stage', 'tests', '--stall-timeout', '0'], { cwd: repo.work, env: { ...process.env, ...repo.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+     let err = '';
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 5ace6cf535399dc706241fac4b938319c43c54d0 Mon Sep 17 00:00:00 2001
+From: Luis Diaz Sendel <471802+lsendel@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 18:43:06 -0400
+Subject: [PATCH 2/2] test: isolate native fixtures from macOS host paths and
+ startup files
+
+---
+ test/aside-driver.test.ts       | 10 +++++-----
+ test/auq-native-capture.test.ts |  7 +++++--
+ test/codex-model-probe.test.ts  |  2 ++
+ 3 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/test/aside-driver.test.ts b/test/aside-driver.test.ts
+index 0dfeeee..c298067 100644
+--- a/test/aside-driver.test.ts
++++ b/test/aside-driver.test.ts
+@@ -231,7 +231,7 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
+       for (const arm of arms) {
+         const PATH = arm === 'none' ? base : `${shellPath(path.join(dir, arm))}:${base}`;
+         for (const shell of shells) {
+-          const r = spawnSync(shell, ['-c', setupProbe], { env: { PATH }, encoding: 'utf8', timeout: 30_000 });
++          const r = spawnSync(shell, ['-c', setupProbe], { env: { HOME: dir, ZDOTDIR: dir, PATH }, encoding: 'utf8', timeout: 30_000 });
+           const status = arm === 'none' ? 'ASIDE_UNAVAILABLE: bounded probe unavailable' : 'READY: aside';
+           const name = path.basename(shell).replace(/\.exe$/i, '');
+           expect(`${name}/${arm}: ${r.stdout.trim()}`).toBe(`${name}/${arm}: ${status}`);
+@@ -240,7 +240,7 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
+       const reasons = { window: 'No browser window is open for account u0', preload: "Error: Cannot find module '/x/preload.cjs'" };
+       for (const [name, reason] of Object.entries(reasons)) {
+         for (const shell of shells) {
+-          const r = spawnSync(shell, ['-c', setupProbe], { env: { PATH: `${shellPath(path.join(dir, 'gt'))}:${shellPath(path.join(dir, name))}` }, encoding: 'utf8', timeout: 30_000 });
++          const r = spawnSync(shell, ['-c', setupProbe], { env: { HOME: dir, ZDOTDIR: dir, PATH: `${shellPath(path.join(dir, 'gt'))}:${shellPath(path.join(dir, name))}` }, encoding: 'utf8', timeout: 30_000 });
+           const executableName = path.basename(shell).replace(/\.exe$/i, '');
+           expect(`${executableName}/${name}: ${r.stdout.trim()}`).toBe(`${executableName}/${name}: ASIDE_CLI_ERROR: exit 1; inspect aside --help locally`);
+           expect(r.stdout).not.toContain(reason);
+@@ -248,16 +248,16 @@ describe('Aside driver contract ({{ASIDE_SETUP}})', () => {
+       }
+       // Both ways out stay reachable: opted out, and Aside not installed (empty PATH dir).
+       const sh = shells[0];
+-      const optOut = spawnSync(sh, ['-c', setupProbe], { env: { PATH: base, GSTACK_SKIP_ASIDE: '1', GSTACK_PLATFORM: 'Darwin' }, encoding: 'utf8', timeout: 30_000 });
++      const optOut = spawnSync(sh, ['-c', setupProbe], { env: { HOME: dir, ZDOTDIR: dir, PATH: base, GSTACK_SKIP_ASIDE: '1', GSTACK_PLATFORM: 'Darwin' }, encoding: 'utf8', timeout: 30_000 });
+       expect(optOut.stdout.trim()).toBe('NEEDS_ASIDE: Darwin');
+-      const noAside = spawnSync(sh, ['-c', setupProbe], { env: { PATH: shellPath(path.join(dir, 'gt')), GSTACK_PLATFORM: 'Linux' }, encoding: 'utf8', timeout: 30_000 });
++      const noAside = spawnSync(sh, ['-c', setupProbe], { env: { HOME: dir, ZDOTDIR: dir, PATH: shellPath(path.join(dir, 'gt')), GSTACK_PLATFORM: 'Linux' }, encoding: 'utf8', timeout: 30_000 });
+       expect(noAside.stdout.trim()).toBe('NEEDS_ASIDE: Linux');
+       // E7 (#2902): installed only at ~/.local/bin (not on the macOS login PATH) is still found, and named.
+       const home = path.join(dir, 'home');
+       write(path.join(home, '.local', 'bin', 'aside'), '#!/bin/sh\necho "ASIDE_READY /tmp/x"\n');
+       wrap(lookup('grep')!, path.join(dir, 'grep-only', 'grep'));
+       for (const shell of shells) {
+-        const offPath = spawnSync(shell, ['-c', setupProbe], { env: { HOME: home, PATH: `${shellPath(path.join(dir, 'gt'))}:${shellPath(path.join(dir, 'grep-only'))}` }, encoding: 'utf8', timeout: 30_000 });
++        const offPath = spawnSync(shell, ['-c', setupProbe], { env: { HOME: home, ZDOTDIR: dir, PATH: `${shellPath(path.join(dir, 'gt'))}:${shellPath(path.join(dir, 'grep-only'))}` }, encoding: 'utf8', timeout: 30_000 });
+         expect(offPath.stdout.trim()).toBe(`READY: ${path.join(home, '.local', 'bin', 'aside')}`);
+       }
+     } finally {
+diff --git a/test/auq-native-capture.test.ts b/test/auq-native-capture.test.ts
+index 270314a..204542f 100644
+--- a/test/auq-native-capture.test.ts
++++ b/test/auq-native-capture.test.ts
+@@ -489,7 +489,8 @@ await new Promise(()=>{});
+ `;
+ 
+ test.skipIf(process.platform === 'win32')('real PTY observes native public calls, preserves failures, model/tool scope and cleans every outcome', async () => {
+-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'native-auq-pty-'));
++  // The child reports its canonical cwd; retain exact recorder ownership on macOS /var -> /private/var.
++  const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'native-auq-pty-')));
+   const fake=path.join(dir,'fake-claude'), worker=path.join(dir,'worker.ts');
+   const temp=path.join(dir,'tmp'); fs.mkdirSync(temp);
+   fs.writeFileSync(fake,`#!${process.execPath}\n`+FAKE_CLI,{mode:0o755});
+@@ -590,7 +591,9 @@ fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({results,privateR
+       expect(prompt).toContain(path.join(dir,result.kind,'plan-eng-review','SKILL.md'));
+       expect(prompt).toContain('Review plan.md.');expect(prompt).toContain('Skip any system-audit / environment-setup / codebase-exploration steps.');
+       expect(prompt).toContain('ask the user through the AskUserQuestion tool');
+-      for(const absent of ['verbatim','would call','write the','ELI10','Pros / cons:','Net:','private','reasoning']) expect(prompt).not.toContain(absent);
++      // Paths are already checked exactly above; macOS /private is not a request for private reasoning.
++      const promptInstructions = prompt.replaceAll(path.join(dir,result.kind,'plan-eng-review','SKILL.md'), '<skill-path>');
++      for(const absent of ['verbatim','would call','write the','ELI10','Pros / cons:','Net:','private','reasoning']) expect(promptInstructions).not.toContain(absent);
+       if(result.kind.endsWith('artifact-error')){
+         expect(result.receipt).toBeNull();expect(result.text).toBeUndefined();
+         expect(result.error).toContain(result.kind==='artifact-error'?'fixture receipt disk full':'[reasoning_extraction]');
+diff --git a/test/codex-model-probe.test.ts b/test/codex-model-probe.test.ts
+index 08ce9a8..bdd7753 100644
+--- a/test/codex-model-probe.test.ts
++++ b/test/codex-model-probe.test.ts
+@@ -103,6 +103,8 @@ function makeFixture(): Fixture {
+   fs.mkdirSync(codexHome, { recursive: true });
+   fs.mkdirSync(gstackHome, { recursive: true });
+   fs.writeFileSync(path.join(stubDir, 'codex'), STUB, { mode: 0o755 });
++  // This fixture exercises the Linux sandbox branch on every host; the Darwin case overrides it.
++  fs.writeFileSync(path.join(stubDir, 'uname'), '#!/bin/sh\necho Linux\n', { mode: 0o755 });
+   fs.writeFileSync(path.join(codexHome, 'config.toml'), 'model = "gpt-5.4"\n');
+   fs.writeFileSync(path.join(codexHome, 'auth.json'), '{}');
+   const stubLog = path.join(home, 'stub.log');
+-- 
+2.54.0 (Apple Git-157)
+

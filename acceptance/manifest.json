@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "base": "514fbfdc9799376edfd2536f60659501a48ead64",
+  "source": "5ace6cf535399dc706241fac4b938319c43c54d0",
+  "tree": "5bad460e6481dd8ece05e1c1ba46e45df83d2d25",
+  "payload": {
+    "source.bundle": {
+      "bytes": 38498847,
+      "sha256": "3359bbe7aca92f5dca90b90fe8491daf7145a616c89d228d23ceb724e0b2bb89"
+    },
+    "shallow": {
+      "bytes": 41,
+      "sha256": "6434b00c16fcb898721aceddc92372bf3a18389cb6f9de65cd3fe5bf3a6bd026"
+    },
+    "repair.patch": {
+      "bytes": 39439,
+      "sha256": "160519db44215b9ff342606c0f773bb9047796d9038d47af2dc483183eece4af"
+    }
+  }
+}
