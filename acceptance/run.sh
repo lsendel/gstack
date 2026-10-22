@@ -106,6 +106,7 @@ SWIFT
   rm -rf "$swift_warm"
 fi
 git status --short > "$evidence/post-setup-status.txt"
+git diff --binary > "$evidence/post-setup.diff"
 sha256sum browse/dist/browse make-pdf/dist/pdf lib/diagram-render/dist/diagram-render.html lib/diagram-render/dist/BUILD_INFO.json bin/gstack-cso-core bin/gstack-cso-launcher bin/gstack-cso-watchdog > "$evidence/build-sha256.txt"
 clean bash bin/gstack-wtree > "$evidence/tested-working-tree.txt"
 test -s "$evidence/tested-working-tree.txt"
@@ -128,6 +129,10 @@ cmp "$evidence/tested-working-tree.txt" "$evidence/final-working-tree.txt"
 sha256sum -c "$evidence/build-sha256.txt"
 test "$(git rev-parse HEAD)" = 5ace6cf535399dc706241fac4b938319c43c54d0
 test "$(git rev-parse 'HEAD^{tree}')" = 5bad460e6481dd8ece05e1c1ba46e45df83d2d25
-git diff --stat > "$evidence/post-test-diff.txt"
+git status --short > "$evidence/post-test-status.txt"
+cmp "$evidence/post-setup-status.txt" "$evidence/post-test-status.txt"
+git diff --binary > "$evidence/post-test.diff"
+cmp "$evidence/post-setup.diff" "$evidence/post-test.diff"
+git diff --stat -- . ':!lib/diagram-render/dist/BUILD_INFO.json' ':!lib/diagram-render/dist/diagram-render.html' > "$evidence/post-test-diff.txt"
 test ! -s "$evidence/post-test-diff.txt"
 exit "$result"
