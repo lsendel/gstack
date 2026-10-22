@@ -16,6 +16,7 @@ interface ProcSnapshot {
   name: string;
   seccomp: string;
   noNewPrivs: string;
+  nstgid: number[];
   cmdline: string[];
 }
 
@@ -29,12 +30,18 @@ function readProcSnapshot(pid: number): ProcSnapshot | null {
     };
     const ppid = Number.parseInt(field('PPid'), 10);
     if (!Number.isInteger(ppid)) return null;
+    const nstgid = field('NStgid')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((n) => Number.parseInt(n, 10))
+      .filter((n) => Number.isInteger(n));
     return {
       pid,
       ppid,
       name: field('Name'),
       seccomp: field('Seccomp'),
       noNewPrivs: field('NoNewPrivs'),
+      nstgid,
       cmdline: cmdlineRaw.split('\0').filter(Boolean),
     };
   } catch {
@@ -42,15 +49,30 @@ function readProcSnapshot(pid: number): ProcSnapshot | null {
   }
 }
 
-function collectProcessTree(rootPid: number): ProcSnapshot[] {
+/**
+ * Collect all processes belonging to the launched Chromium instance.
+ * Note: Under the SUID sandbox (`chrome-sandbox`), the helper clones the
+ * sandboxed `--type=zygote` into a new PID namespace (`CLONE_NEWPID`, where
+ * `NStgid` has 2 entries with namespace PID 1) and then exits, so the
+ * sandboxed zygote is reparented in the host PID namespace while keeping
+ * `cmdline[0] === rootExe`. Matching both `cmdline[0] === rootExe` and any
+ * PPid descendants captures both direct children and PID-namespaced zygote/renderer
+ * processes.
+ */
+function collectBrowserProcesses(rootPid: number, rootExe: string): ProcSnapshot[] {
   const all = new Map<number, ProcSnapshot>();
   for (const entry of fs.readdirSync('/proc')) {
     if (!/^\d+$/.test(entry)) continue;
     const snap = readProcSnapshot(Number.parseInt(entry, 10));
     if (snap) all.set(snap.pid, snap);
   }
+  const queue: number[] = [rootPid];
+  for (const snap of all.values()) {
+    if (snap.cmdline[0] === rootExe || snap.cmdline[0]?.startsWith(rootExe + ' ')) {
+      queue.push(snap.pid);
+    }
+  }
   const tree: ProcSnapshot[] = [];
-  const queue = [rootPid];
   const seen = new Set<number>();
   while (queue.length > 0) {
     const current = queue.shift()!;
@@ -64,11 +86,22 @@ function collectProcessTree(rootPid: number): ProcSnapshot[] {
       }
     }
   }
-  return tree;
+  return tree.sort((a, b) => a.pid - b.pid);
 }
 
 const manager = new BrowserManager();
 let browserEvidence: Record<string, unknown> = {};
+let inotifyEvidence: Record<string, unknown> = {};
+const writeEvidence = () => {
+  if (process.env.GSTACK_PREFLIGHT_EVIDENCE) {
+    fs.writeFileSync(
+      process.env.GSTACK_PREFLIGHT_EVIDENCE,
+      JSON.stringify({ browser: browserEvidence, inotify: inotifyEvidence }, null, 2) + '\n',
+      { mode: 0o600 },
+    );
+  }
+};
+
 try {
   await manager.launch();
   const page = manager.getPage();
@@ -82,21 +115,9 @@ try {
   const rootExe = fs.realpathSync(`/proc/${procInfo.pid}/exe`);
   assert.match(rootExe, /\/chromium_headless_shell-\d+\/chrome-headless-shell-linux64\/chrome-headless-shell$/);
 
-  const tree = collectProcessTree(procInfo.pid);
-  const rootSnap = tree.find((p) => p.pid === procInfo.pid);
-  assert.ok(rootSnap, 'Root Chromium process missing from /proc snapshot');
-  for (const proc of tree) {
-    assert.equal(proc.cmdline.includes('--no-sandbox'), false, `Process ${proc.pid} has --no-sandbox`);
-    assert.equal(proc.cmdline.includes('--disable-setuid-sandbox'), false, `Process ${proc.pid} has --disable-setuid-sandbox`);
-  }
-  const zygotes = tree.filter((p) => p.cmdline.includes('--type=zygote'));
-  const renderers = tree.filter((p) => p.cmdline.includes('--type=renderer'));
-  assert.ok(zygotes.length > 0, 'Expected at least one --type=zygote process');
-  assert.ok(renderers.length > 0, 'Expected at least one --type=renderer process');
-  for (const renderer of renderers) {
-    assert.equal(renderer.seccomp, '2', `Expected Seccomp: 2 (filter) on renderer ${renderer.pid}, got ${renderer.seccomp}`);
-    assert.equal(renderer.noNewPrivs, '1', `Expected NoNewPrivs: 1 on renderer ${renderer.pid}, got ${renderer.noNewPrivs}`);
-  }
+  const tree = collectBrowserProcesses(procInfo.pid, rootExe);
+  const zygotes = tree.filter((p) => p.cmdline.some((arg) => arg === '--type=zygote' || arg.startsWith('--type=zygote ')));
+  const renderers = tree.filter((p) => p.cmdline.some((arg) => arg === '--type=renderer' || arg.startsWith('--type=renderer ')));
   browserEvidence = {
     shouldEnableChromiumSandbox: shouldEnableChromiumSandbox(),
     rootPid: procInfo.pid,
@@ -107,6 +128,21 @@ try {
     rendererCount: renderers.length,
     processTree: tree,
   };
+  writeEvidence();
+
+  const rootSnap = tree.find((p) => p.pid === procInfo.pid);
+  assert.ok(rootSnap, 'Root Chromium process missing from /proc snapshot');
+  for (const proc of tree) {
+    assert.equal(proc.cmdline.some((arg) => arg === '--no-sandbox' || arg.includes('--no-sandbox')), false, `Process ${proc.pid} has --no-sandbox`);
+    assert.equal(proc.cmdline.some((arg) => arg === '--disable-setuid-sandbox' || arg.includes('--disable-setuid-sandbox')), false, `Process ${proc.pid} has --disable-setuid-sandbox`);
+  }
+  assert.ok(zygotes.length > 0, 'Expected at least one --type=zygote process');
+  assert.ok(renderers.length > 0, 'Expected at least one --type=renderer process');
+  for (const renderer of renderers) {
+    assert.equal(renderer.seccomp, '2', `Expected Seccomp: 2 (filter) on renderer ${renderer.pid}, got ${renderer.seccomp}`);
+    assert.equal(renderer.noNewPrivs, '1', `Expected NoNewPrivs: 1 on renderer ${renderer.pid}, got ${renderer.noNewPrivs}`);
+    assert.ok(renderer.nstgid.length >= 2, `Expected renderer ${renderer.pid} to run in nested PID namespace, got NStgid=${renderer.nstgid.join(',')}`);
+  }
 } finally {
   await manager.close();
 }
@@ -116,7 +152,6 @@ fs.chmodSync(inotifyRoot, 0o700);
 for (const dir of ['.qa-state', 'qa-reports', 'src', 'test']) {
   fs.mkdirSync(path.join(inotifyRoot, dir), { mode: 0o700 });
 }
-let inotifyEvidence: Record<string, unknown> = {};
 try {
   const observer = await observeQAWrites(inotifyRoot);
   const tmpFile = path.join(inotifyRoot, '.qa-state', 'probe.tmp');
@@ -125,24 +160,18 @@ try {
   fs.renameSync(tmpFile, finalFile);
   const observation = observer.stop();
   const verdict = qaWriteVerdict(observation, 'qa-only');
-  assert.equal(observation.complete, true);
-  assert.ok(observation.events.length >= 2);
-  assert.deepEqual(verdict, []);
   inotifyEvidence = {
     complete: observation.complete,
     eventCount: observation.events.length,
     events: observation.events,
     verdict,
   };
+  writeEvidence();
+  assert.equal(observation.complete, true);
+  assert.ok(observation.events.length >= 2);
+  assert.deepEqual(verdict, []);
 } finally {
   fs.rmSync(inotifyRoot, { recursive: true, force: true });
 }
 
-if (process.env.GSTACK_PREFLIGHT_EVIDENCE) {
-  fs.writeFileSync(
-    process.env.GSTACK_PREFLIGHT_EVIDENCE,
-    JSON.stringify({ browser: browserEvidence, inotify: inotifyEvidence }, null, 2) + '\n',
-    { mode: 0o600 },
-  );
-}
 console.log('ACTUAL_SANDBOXED_BROWSE_PREFLIGHT_PASS');
